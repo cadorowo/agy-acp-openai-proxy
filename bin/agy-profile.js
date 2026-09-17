@@ -16,6 +16,32 @@ function ensureProfilesDir() {
   }
 }
 
+async function getAccessToken(tokenFile) {
+  if (!fs.existsSync(tokenFile)) return null;
+  try {
+    const raw = fs.readFileSync(tokenFile, "utf8");
+    const data = JSON.parse(raw);
+    const refreshToken = data.refresh_token;
+    if (!refreshToken) return null;
+    const res = await fetch(data.token_uri || "https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: data.client_id,
+        client_secret: data.client_secret || "",
+        refresh_token: refreshToken,
+        grant_type: "refresh_token",
+      }).toString(),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return null;
+    const tokenRes = await res.json();
+    return tokenRes.access_token || null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchEmailFromToken(tokenFile) {
   if (!fs.existsSync(tokenFile)) return null;
   try {
@@ -76,6 +102,78 @@ async function fetchEmailFromToken(tokenFile) {
   } catch (err) {
     return `⚠️ ${err.message}`;
   }
+}
+
+const UA_ACP = "antigravity/acp/0.1.0 (aidev_client; os_type=linux; arch=x86_64; host_path=unknown/unknown; proxy_client=antigravity/sdk)";
+
+async function fetchGoogleQuota(tokenFile) {
+  const accessToken = await getAccessToken(tokenFile);
+  if (!accessToken) return null;
+
+  let quotaData = null;
+  try {
+    const res = await fetch("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "User-Agent": UA_ACP,
+      },
+      body: JSON.stringify({ project: "aicode-consumers" }),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) {
+      quotaData = await res.json();
+    }
+  } catch {}
+
+  let tierName = "Standard";
+  try {
+    const cRes = await fetch("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "User-Agent": UA_ACP,
+      },
+      body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (cRes.ok) {
+      const cData = await cRes.json();
+      tierName = cData.paidTier?.name || cData.currentTier?.name || "Standard";
+    }
+  } catch {}
+
+  return { quota: quotaData, tier: tierName };
+}
+
+function makeProgressBar(fraction, width = 16) {
+  const safeFrac = Math.max(0, Math.min(1, fraction ?? 1));
+  const filled = Math.round(safeFrac * width);
+  const empty = width - filled;
+  let color = "\x1b[32m"; // green
+  if (safeFrac < 0.25) color = "\x1b[31m"; // red
+  else if (safeFrac < 0.6) color = "\x1b[33m"; // yellow
+  return `${color}[${"█".repeat(filled)}${"░".repeat(empty)}]\x1b[0m ${(safeFrac * 100).toFixed(1)}%`;
+}
+
+function formatRelativeReset(isoStr) {
+  if (!isoStr) return "";
+  const diffMs = new Date(isoStr).getTime() - Date.now();
+  if (diffMs <= 0) return "in reset ora";
+  const mins = Math.floor(diffMs / 60000);
+  const hours = Math.floor(mins / 60);
+  const days = Math.floor(hours / 24);
+  if (days > 0) {
+    const remHours = hours % 24;
+    return `resetta tra ${days}d ${remHours}h`;
+  }
+  if (hours > 0) {
+    const remMins = mins % 60;
+    return `resetta tra ${hours}h ${remMins}m`;
+  }
+  return `resetta tra ${mins}m`;
 }
 
 async function listProfiles() {
@@ -331,6 +429,74 @@ async function getPoolStatus() {
   }
 }
 
+async function showQuotaDashboard(filterName) {
+  ensureProfilesDir();
+  const profiles = [];
+
+  const defaultToken = path.join(DEFAULT_GEMINI_HOME, "antigravity-acp", "acp_token.json");
+  profiles.push({
+    id: "default",
+    name: "default (primario)",
+    tokenFile: defaultToken,
+  });
+
+  if (fs.existsSync(PROFILES_DIR)) {
+    const entries = fs.readdirSync(PROFILES_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const token = path.join(PROFILES_DIR, entry.name, "antigravity-acp", "acp_token.json");
+        profiles.push({
+          id: entry.name,
+          name: entry.name,
+          tokenFile: token,
+        });
+      }
+    }
+  }
+
+  const targets = filterName ? profiles.filter((p) => p.id === filterName) : profiles;
+  if (targets.length === 0) {
+    console.error(`❌ Profilo '${filterName}' non trovato.`);
+    process.exit(1);
+  }
+
+  console.log("\n=========================================================================");
+  console.log(" ⚡ Quota & Limiti Ufficiali Google Antigravity (CCPA API)");
+  console.log("=========================================================================\n");
+
+  for (const p of targets) {
+    const email = await fetchEmailFromToken(p.tokenFile);
+    const gInfo = await fetchGoogleQuota(p.tokenFile);
+
+    const tierBadge = gInfo?.tier ? `\x1b[35m[${gInfo.tier}]\x1b[0m` : "";
+    console.log(`▸ Profilo: \x1b[1m\x1b[36m${p.id}\x1b[0m — \x1b[33m${email || "N/A"}\x1b[0m ${tierBadge}`);
+
+    if (!gInfo || !gInfo.quota || !gInfo.quota.groups) {
+      console.log("  ⚠️ Impossibile recuperare i dettagli della quota da Google.");
+      console.log("");
+      continue;
+    }
+
+    for (const group of gInfo.quota.groups) {
+      const isGemini = group.displayName?.toLowerCase().includes("gemini");
+      const icon = isGemini ? "♊" : "🤖";
+      console.log(`  ${icon} \x1b[1m${group.displayName}\x1b[0m:`);
+
+      const buckets = group.buckets || [];
+      buckets.forEach((b, idx) => {
+        const isLast = idx === buckets.length - 1;
+        const branch = isLast ? "└─" : "├─";
+        const bar = makeProgressBar(b.remainingFraction);
+        const rel = b.resetTime ? `(${formatRelativeReset(b.resetTime)})` : "";
+        const label = b.window === "5h" ? "Finestra 5 Ore:   " : "Quota Settimanale:";
+        console.log(`     ${branch} ${label} ${bar} ${rel}`);
+      });
+    }
+    console.log("");
+  }
+  console.log("-------------------------------------------------------------------------\n");
+}
+
 async function main() {
   const [cmd, arg1] = process.argv.slice(2);
 
@@ -350,6 +516,14 @@ async function main() {
     case "test":
       await testProfile(arg1 || "default");
       break;
+    case "quota":
+    case "usage":
+      await showQuotaDashboard(arg1);
+      await getPoolStatus();
+      break;
+    case "status":
+      await getPoolStatus();
+      break;
     case "remove":
     case "rm":
       if (!arg1) {
@@ -358,17 +532,15 @@ async function main() {
       }
       await removeProfile(arg1);
       break;
-    case "status":
-    case "usage":
-      await getPoolStatus();
-      break;
     default:
       console.log(`
 Antigravity ACP Profile Manager — Multi-Account & Multi-Session CLI
 
 Comandi disponibili:
+  agy-profile quota [nome]      Mostra i limiti % ufficiali Google (Gemini, Claude, 5h, weekly)
+  agy-profile usage             Dashboard completa: quote Google + statistiche proxy
   agy-profile list              Elenca tutti i profili registrati e i relativi account Google
-  agy-profile usage (o status)  Mostra token consumati, turni e stato quota di ciascun account
+  agy-profile status            Stato dei worker proxy, turni attivi e cooldown
   agy-profile login <nome>      Collega un nuovo account Google con nome specificato
   agy-profile test [nome]       Verifica la connettività e le credenziali di un profilo
   agy-profile remove <nome>     Rimuove un profilo secondario
