@@ -110,6 +110,9 @@ export class ACPPool {
       accountEmail: null,
       stats: {
         totalTurns: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
         totalErrors: 0,
         total429s: 0,
       },
@@ -307,6 +310,20 @@ export class ACPPool {
           cwd,
           signal,
         });
+
+        if (stream) {
+          result.once("done", ({ usage }) => {
+            if (usage) {
+              worker.stats.promptTokens += (usage.prompt_tokens || 0);
+              worker.stats.completionTokens += (usage.completion_tokens || 0);
+              worker.stats.totalTokens += (usage.total_tokens || 0);
+            }
+          });
+        } else if (result?.usage) {
+          worker.stats.promptTokens += (result.usage.prompt_tokens || 0);
+          worker.stats.completionTokens += (result.usage.completion_tokens || 0);
+          worker.stats.totalTokens += (result.usage.total_tokens || 0);
+        }
 
         return result;
       } catch (turnErr) {

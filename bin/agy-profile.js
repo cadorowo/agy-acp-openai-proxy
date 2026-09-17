@@ -296,21 +296,35 @@ async function getPoolStatus() {
     const res = await fetch(`${PROXY_URL}/v1/pool/status`, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    console.log("\n=======================================================");
-    console.log(" 📊 Stato Attuale del Pool Proxy (Port 1234)");
-    console.log("=======================================================\n");
-    console.log(`Totale Profili:   ${data.totalProfiles}`);
-    console.log(`Profili Sani:     ${data.healthyProfiles}`);
-    console.log(`Turni in corso:   ${data.activeTurnsTotal}\n`);
+    console.log("\n=========================================================================");
+    console.log(" 📊 Stato & Utilizzo (Usage) del Pool Antigravity ACP (Port 1234)");
+    console.log("=========================================================================\n");
+    console.log(`Profili Registrati:  ${data.totalProfiles} (${data.healthyProfiles} operativi)`);
+    console.log(`Turni Concorrenti:   ${data.activeTurnsTotal}`);
+    console.log(`Sessioni con Caching: ${data.sessionAffinityCount}\n`);
+
     for (const p of data.profiles) {
       const icon = p.status === "healthy" ? "🟢" : (p.status === "cooldown" ? "⏳" : "🔴");
-      console.log(`${icon} \x1b[1m${p.id}\x1b[0m — Stato: ${p.status} | Account: ${p.accountEmail || "N/A"} | Turni attivi: ${p.activeTurns}`);
+      const stats = p.stats || {};
+      const turns = stats.totalTurns || 0;
+      const promptTok = (stats.promptTokens || 0).toLocaleString();
+      const compTok = (stats.completionTokens || 0).toLocaleString();
+      const totalTok = (stats.totalTokens || 0).toLocaleString();
+      const q429 = stats.total429s || 0;
+
+      console.log(`${icon} Profilo: \x1b[1m\x1b[36m${p.id}\x1b[0m — \x1b[33m${p.accountEmail || "N/A"}\x1b[0m`);
+      console.log(`   ├─ Stato Quota:     \x1b[1m${p.status.toUpperCase()}\x1b[0m (Turni attivi ora: ${p.activeTurns})`);
+      console.log(`   ├─ Turni Gestiti:   ${turns}`);
+      console.log(`   ├─ Token Utilizzati: ${totalTok} (Input: ${promptTok} | Output: ${compTok})`);
+      console.log(`   └─ Quota Esaurita:  ${q429 > 0 ? `\x1b[31m${q429} volte\x1b[0m` : "0 (quota libera)"}`);
+
       if (p.cooldownUntil && p.cooldownUntil > Date.now()) {
         const secs = Math.ceil((p.cooldownUntil - Date.now()) / 1000);
-        console.log(`   └─ Cooldown residuo: ${secs}s (Motivo: ${p.lastError || "429 Quota"})`);
+        console.log(`      \x1b[31m└─ ⏳ In Cooldown per ancora ${secs}s (Motivo: ${p.lastError || "429 Quota"})\x1b[0m`);
       }
+      console.log("");
     }
-    console.log("\n-------------------------------------------------------\n");
+    console.log("-------------------------------------------------------------------------\n");
   } catch (err) {
     console.log(`⚠️ Impossibile contattare il proxy su ${PROXY_URL}: ${err.message}`);
     console.log("Verifica che il servizio `agy-acp-proxy` sia avviato.");
@@ -345,6 +359,7 @@ async function main() {
       await removeProfile(arg1);
       break;
     case "status":
+    case "usage":
       await getPoolStatus();
       break;
     default:
@@ -353,9 +368,9 @@ Antigravity ACP Profile Manager — Multi-Account & Multi-Session CLI
 
 Comandi disponibili:
   agy-profile list              Elenca tutti i profili registrati e i relativi account Google
+  agy-profile usage (o status)  Mostra token consumati, turni e stato quota di ciascun account
   agy-profile login <nome>      Collega un nuovo account Google con nome specificato
   agy-profile test [nome]       Verifica la connettività e le credenziali di un profilo
-  agy-profile status            Mostra lo stato in tempo reale del pool proxy (salute, turni, cooldown)
   agy-profile remove <nome>     Rimuove un profilo secondario
 `);
       break;
