@@ -1,9 +1,9 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import os from "node:os";
-import { ACPClient, CANONICAL_MODELS, estimateTokens } from "./acp-client.js";
-import { SessionManager } from "./session-manager.js";
+import { CANONICAL_MODELS, estimateTokens } from "./acp-client.js";
 import { authenticateRequest } from "./auth.js";
+import { ACPPool } from "./pool-manager.js";
 
 const PORT = parseInt(process.env.PORT || "1234", 10);
 const ACP_COMMAND = process.env.ACP_COMMAND || "agy-acp";
@@ -14,12 +14,11 @@ const HOST = process.env.HOST || null;
 
 const CANONICAL_MODEL_SET = new Set(CANONICAL_MODELS);
 
-const acp = new ACPClient({
+const pool = new ACPPool({
   command: ACP_COMMAND,
   cwd: WORKSPACE_DIR,
 });
-
-const sessionManager = new SessionManager(acp);
+await pool.init();
 
 function getTailscaleIp() {
   if (process.env.TAILSCALE_IP) {
@@ -173,19 +172,13 @@ const requestHandler = async (req, res) => {
     return;
   }
 
-  // Health Check
+  // Health Check (Public minimal probe, avoids internal metadata disclosure)
   if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
-    const tailscaleIp = getTailscaleIp();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
         status: "ok",
-        backend: ACP_COMMAND,
-        default_model: ACP_MODEL,
-        workspace: WORKSPACE_DIR,
-        auth_enabled: Boolean(PROXY_API_KEY),
-        tailscale_ip: tailscaleIp,
-        active_sessions: sessionManager.listSessions(),
+        service: "agy-acp-openai-proxy",
       })
     );
     return;
@@ -208,10 +201,24 @@ const requestHandler = async (req, res) => {
     return;
   }
 
+  // Pool Management & Status Endpoints
+  if (req.method === "GET" && req.url === "/v1/pool/status") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(pool.getStatus()));
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/v1/pool/profiles/refresh") {
+    await pool.refreshProfiles();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, status: pool.getStatus() }));
+    return;
+  }
+
   // Session Management Endpoints
   if (req.method === "GET" && req.url === "/v1/sessions") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ sessions: sessionManager.listSessions() }));
+    res.end(JSON.stringify({ sessions: pool.listSessions() }));
     return;
   }
 
@@ -227,11 +234,11 @@ const requestHandler = async (req, res) => {
       }
 
       if (body.session_id) {
-        await sessionManager.destroySession(body.session_id);
+        await pool.destroySession(body.session_id);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, reset: body.session_id }));
       } else {
-        const count = await sessionManager.resetAllSessions();
+        const count = await pool.resetAllSessions();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, count }));
       }
@@ -241,7 +248,7 @@ const requestHandler = async (req, res) => {
 
   if (req.method === "DELETE" && req.url.startsWith("/v1/sessions/")) {
     const sessionId = decodeURIComponent(req.url.replace("/v1/sessions/", ""));
-    const deleted = await sessionManager.destroySession(sessionId);
+    const deleted = await pool.destroySession(sessionId);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, sessionId, deleted }));
     return;
@@ -256,7 +263,7 @@ const requestHandler = async (req, res) => {
     }
     sessionKey = sessionKey || "default";
 
-    const ctx = sessionManager.getSessionContext(sessionKey);
+    const ctx = pool.getSessionContext(sessionKey);
     if (!ctx) {
       return sendError(res, 404, `No active context recorded for session '${sessionKey}'`, "not_found");
     }
@@ -301,10 +308,10 @@ const requestHandler = async (req, res) => {
       }
 
       // Resolve logical session for concurrency and turn routing
-      const sessionKey = sessionManager.resolveSessionKey(req, body);
+      const sessionKey = pool.resolveSessionKey(req, body);
 
       // Context size estimation upfront
-      const promptText = acp.formatPrompt(body.messages, body.response_format);
+      const promptText = pool.formatPrompt(body.messages, body.response_format);
       const promptChars = promptText.length;
       const promptTokens = estimateTokens(promptText);
 
@@ -329,6 +336,7 @@ const requestHandler = async (req, res) => {
         res.write(`data: ${JSON.stringify(initialChunk)}\n\n`);
 
         // Keep-Alive Heartbeat every 10s until completion to prevent tunnel idle timeouts
+        const abortController = new AbortController();
         let isEnded = false;
         const keepAliveTimer = setInterval(() => {
           if (!isEnded && !res.writableEnded) {
@@ -347,22 +355,58 @@ const requestHandler = async (req, res) => {
           }
         };
 
-        req.on("close", cleanup);
+        res.on("close", () => {
+          cleanup();
+          if (!res.writableEnded) {
+            console.warn(`[HTTP] Client aborted stream connection for session '${sessionKey}'`);
+            abortController.abort();
+          }
+        });
+
+        // Backpressure queue for SSE chunk writes
+        const chunkQueue = [];
+
+        const flushQueue = (callback) => {
+          while (chunkQueue.length > 0 && !res.writableEnded) {
+            const chunk = chunkQueue.shift();
+            const ok = res.write(chunk);
+            if (!ok) {
+              res.once("drain", () => flushQueue(callback));
+              return;
+            }
+          }
+          if (callback && chunkQueue.length === 0) {
+            callback();
+          }
+        };
+
+        const pushChunk = (payload) => {
+          if (res.writableEnded) return;
+          if (chunkQueue.length > 0) {
+            chunkQueue.push(payload);
+          } else {
+            const ok = res.write(payload);
+            if (!ok) {
+              res.once("drain", () => flushQueue());
+            }
+          }
+        };
 
         try {
-          const emitter = await sessionManager.executeTurn({
+          const emitter = await pool.executeTurn({
             sessionKey,
             messages: body.messages,
             responseFormat: body.response_format,
             stream: true,
             model: canonicalModel,
             cwd: WORKSPACE_DIR,
+            signal: abortController.signal,
           });
 
           emitter.on("chunk", (textChunk) => {
             if (textChunk && !res.writableEnded) {
               const openAIChunk = formatOpenAIStreamChunk(chunkId, textChunk, canonicalModel, null);
-              res.write(`data: ${JSON.stringify(openAIChunk)}\n\n`);
+              pushChunk(`data: ${JSON.stringify(openAIChunk)}\n\n`);
             }
           });
 
@@ -371,7 +415,7 @@ const requestHandler = async (req, res) => {
             if (!res.writableEnded) {
               const finalReason = stopReason === "end_turn" ? "stop" : stopReason;
               const endChunk = formatOpenAIStreamChunk(chunkId, "", canonicalModel, finalReason);
-              res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+              pushChunk(`data: ${JSON.stringify(endChunk)}\n\n`);
 
               const finalUsage = usage || {
                 prompt_tokens: promptTokens,
@@ -386,19 +430,24 @@ const requestHandler = async (req, res) => {
                 choices: [],
                 usage: finalUsage,
               };
-              res.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
+              pushChunk(`data: ${JSON.stringify(usageChunk)}\n\n`);
+              pushChunk("data: [DONE]\n\n");
 
               console.log(
                 `[Turn Complete] Session '${sessionKey}' | Context: ${finalUsage.prompt_tokens} prompt tokens (${promptChars} chars), ${finalUsage.completion_tokens} completion tokens (${finalUsage.total_tokens} total)`
               );
 
-              res.write("data: [DONE]\n\n");
-              res.end();
+              flushQueue(() => {
+                if (!res.writableEnded) {
+                  res.end();
+                }
+              });
             }
           });
 
           emitter.on("error", (err) => {
             cleanup();
+            chunkQueue.length = 0;
             console.error("[Stream Error]", err);
             if (!res.writableEnded) {
               res.write(`data: ${JSON.stringify({ error: { message: err.message, type: "server_error" } })}\n\n`);
@@ -414,15 +463,27 @@ const requestHandler = async (req, res) => {
       }
 
       // Non-streaming turn execution
+      const abortController = new AbortController();
+      let nonStreamEnded = false;
+
+      res.on("close", () => {
+        if (!nonStreamEnded && !res.writableEnded) {
+          console.warn(`[HTTP] Client aborted non-streaming connection for session '${sessionKey}'`);
+          abortController.abort();
+        }
+      });
+
       try {
-        const result = await sessionManager.executeTurn({
+        const result = await pool.executeTurn({
           sessionKey,
           messages: body.messages,
           responseFormat: body.response_format,
           stream: false,
           model: canonicalModel,
           cwd: WORKSPACE_DIR,
+          signal: abortController.signal,
         });
+        nonStreamEnded = true;
 
         const openAIResponse = formatOpenAICompletion(
           result.content,
@@ -494,10 +555,12 @@ const requestHandler = async (req, res) => {
 };
 
 function printBanner(urls) {
+  const status = pool.getStatus();
   console.log(`=======================================================`);
-  console.log(`🚀 Antigravity ACP ↔ OpenAI Proxy (Multi-Session + SSE Heartbeat)`);
+  console.log(`🚀 Antigravity ACP ↔ OpenAI Proxy (Multi-Account Pooling)`);
   console.log(`- Default Model: ${ACP_MODEL}`);
   console.log(`- ACP Command: ${ACP_COMMAND}`);
+  console.log(`- Active Pool Profiles: ${status.totalProfiles} (${status.healthyProfiles} healthy)`);
   console.log(`- Workspace Dir: ${WORKSPACE_DIR}`);
   console.log(`- Auth Enabled: ${PROXY_API_KEY ? "YES (Bearer/x-api-key)" : "NO (Public)"}`);
   console.log(`- Active Listeners:`);

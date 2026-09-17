@@ -1,9 +1,12 @@
 {
   "name": "agy-acp-openai-proxy",
-  "version": "1.0.0",
-  "description": "OpenAI-compatible HTTP proxy for agy-acp-paseo (Antigravity ACP adapter)",
+  "version": "1.1.0",
+  "description": "OpenAI-compatible HTTP proxy for Antigravity ACP with Multi-Account Pooling & Failover",
   "main": "index.js",
   "type": "module",
+  "bin": {
+    "agy-profile": "./bin/agy-profile.js"
+  },
   "scripts": {
     "start": "node index.js"
   },

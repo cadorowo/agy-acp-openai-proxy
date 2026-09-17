@@ -1,24 +1,49 @@
 # ⚡ agy-acp-openai-proxy
 
-OpenAI-compatible HTTP gateway for **Antigravity ACP** (Agent Client Protocol).
+OpenAI-compatible HTTP gateway for **Antigravity ACP** (Agent Client Protocol) with **Multi-Account Pooling & Automatic 429 Failover**.
 
-Translates standard OpenAI `/v1/chat/completions` requests into ACP JSON-RPC streams over `stdio`, supporting multi-session routing, Server-Sent Events (SSE) streaming, and bearer authentication.
+Translates standard OpenAI `/v1/chat/completions` requests into ACP JSON-RPC streams over `stdio`, supporting multi-account quota multiplication, multi-session routing, Server-Sent Events (SSE) streaming with keepalives, and bearer authentication.
 
 ---
 
 ## 🎯 Features
 
+- **Multi-Account Quota Pooling**: Pool multiple independent Google accounts (`~/.gemini-profiles/*`) to multiply your rate limits and daily quota $N\times$.
+- **Transparent 429 Failover**: Automatically detects `429`, `QUOTA_EXHAUSTED`, or capacity limits, marks the worker in temporary cooldown, and seamlessly re-routes the turn to another healthy account.
+- **Smart Session Affinity**: Keeps turns of the same session on the same worker when possible to maximize token caching and reduce latency.
 - **OpenAI Compatible**: Exposes standard `/v1/chat/completions` and `/v1/models` endpoints.
-- **Full Streaming (SSE)**: Streams tokens in real time compatible with OpenAI SDKs and frontends.
-- **Multi-Session Isolation**: Automatically routes and manages persistent ACP sessions via `X-Session-Id` or `user` field.
-- **Model Support**:
-  - `gemini-3.8-flash-high`
-  - `gemini-3.8-flash-medium`
-  - `gemini-3.8-flash-low`
-  - `claude-sonnet-4-6`
-  - `claude-opus-4-6-thinking`
-- **Optional Bearer Auth**: Secure access via `PROXY_API_KEY` (`Authorization: Bearer <key>` or `X-Api-Key`).
+- **Full Streaming (SSE)**: Real-time SSE streaming with 10s keepalive heartbeats to prevent tunnel/proxy timeouts.
+- **Turn Timeout & Client Abort**: Clean abort handling via `AbortController` and configurable turn timeouts.
+- **CLI Profile Manager (`agy-profile`)**: Manage and authenticate accounts via terminal or remotely.
 - **Zero External Dependencies**: Pure Node.js standard library (Node.js >= 18).
+
+---
+
+## 🚀 Multi-Account Management (`agy-profile`)
+
+The proxy includes the `agy-profile` CLI tool for linking and managing Google accounts.
+
+```bash
+# List all connected accounts and their Google email addresses
+agy-profile list
+
+# Connect a new Google account
+agy-profile login google2
+
+# Check live pool status (workers, active turns, cooldowns)
+agy-profile status
+
+# Test connection and session creation for a profile
+agy-profile test google2
+```
+
+### Remote Authentication (over SSH / Headless)
+When running remotely:
+1. Run `agy-profile login <profile_name>` in your SSH terminal.
+2. Click the Google OAuth link in your local browser.
+3. Sign in and authorize.
+4. When redirected to `localhost`, copy the URL from your browser address bar and paste it into the terminal prompt.
+5. The token is saved and the proxy immediately integrates the new account into the pool without restarts!
 
 ---
 
@@ -38,12 +63,16 @@ cp .env.example .env
 npm start
 ```
 
-By default, listens on port `1234` (`http://0.0.0.0:1234`).
+By default, listens on port `1234` (`http://127.0.0.1:1234` and Tailscale IP if present).
 
-### Health Check
+### Health & Pool Status Check
 
 ```bash
+# Basic health check
 curl http://localhost:1234/health
+
+# Pool status
+curl http://localhost:1234/v1/pool/status
 ```
 
 ---
@@ -97,7 +126,9 @@ curl -X POST http://localhost:1234/v1/chat/completions \
 | `ACP_COMMAND` | `agy-acp` | Path or command to spawn the ACP backend |
 | `ACP_MODEL` | `gemini-3.8-flash-high` | Default model if none specified |
 | `PROXY_API_KEY` | *(empty)* | Optional API token to enforce authentication |
-| `SESSION_TTL_MS` | `1800000` (30 min) | Session timeout before recycling processes |
+| `COOLDOWN_MS` | `600000` (10 min) | Cooldown duration when a profile encounters quota limits |
+| `TURN_TIMEOUT_MS` | `300000` (5 min) | Maximum turn execution timeout |
+| `SESSION_TTL_MS` | `1800000` (30 min) | Idle session timeout |
 
 ---
 

@@ -10,6 +10,7 @@ export class SessionManager {
     this.acp = acpClient;
     this.ttlMs = options.ttlMs || 30 * 60 * 1000; // 30 minutes idle TTL
     this.sweepIntervalMs = options.sweepIntervalMs || 5 * 60 * 1000; // 5 minutes sweep
+    this.turnTimeoutMs = options.turnTimeoutMs || parseInt(process.env.TURN_TIMEOUT_MS || "300000", 10); // 5 minutes turn timeout
     this.sessions = new Map(); // sessionKey -> { sessionKey, acpSessionId, currentModelId, cwd, lastActiveAt, activeTurns, closing }
     this.creating = new Map(); // sessionKey -> Promise<session>
     this.queues = new Map(); // sessionKey -> Promise for the last queued turn
@@ -117,15 +118,26 @@ export class SessionManager {
   /**
    * Executes a turn serialized on this session's dedicated queue.
    * Distinct sessions run concurrently.
+   * Supports turnTimeoutMs and optional AbortSignal to cancel orphaned turns.
    */
-  executeTurn({ sessionKey, messages, responseFormat = null, stream = false, model = null, cwd }) {
+  executeTurn({ sessionKey, messages, responseFormat = null, stream = false, model = null, cwd, signal = null }) {
     return new Promise((resolveResult, rejectResult) => {
+      if (signal?.aborted) {
+        return rejectResult(new Error("Turn aborted by client before execution"));
+      }
+
       // Ensure session object stub exists to chain the queue
       const queueSoFar = this.queues.get(sessionKey) || Promise.resolve();
 
       const turnWork = queueSoFar
         .catch(() => {}) // Prevent previous turn failure from breaking subsequent turns
         .then(async () => {
+          if (signal?.aborted) {
+            const err = new Error("Turn aborted by client while queued");
+            rejectResult(err);
+            return;
+          }
+
           let activeSession;
           try {
             activeSession = await this.getOrCreateSession(sessionKey, { cwd, model });
@@ -138,13 +150,45 @@ export class SessionManager {
           activeSession.activeTurns = (activeSession.activeTurns || 0) + 1;
           const promptText = this.acp.formatPrompt(messages, responseFormat);
 
+          let turnTimer = null;
+          let turnAborted = false;
+          let streamEmitter = null;
+
+          const timeoutPromise = new Promise((_, reject) => {
+            turnTimer = setTimeout(() => {
+              reject(new Error(`Turn execution timed out after ${this.turnTimeoutMs}ms on session '${sessionKey}'`));
+            }, this.turnTimeoutMs);
+            if (turnTimer.unref) turnTimer.unref();
+          });
+
+          let abortPromise = null;
+          let onAbort = null;
+          if (signal) {
+            abortPromise = new Promise((_, reject) => {
+              onAbort = () => {
+                turnAborted = true;
+                reject(new Error("Turn aborted by client"));
+              };
+              signal.addEventListener("abort", onAbort, { once: true });
+            });
+          }
+
+          const cancelRaceList = abortPromise ? [timeoutPromise, abortPromise] : [timeoutPromise];
+
           try {
             if (stream) {
-              const { emitter, completionPromise } = await this.acp.executeOnSession({
+              const sessionPromise = this.acp.executeOnSession({
                 sessionId: activeSession.acpSessionId,
                 promptText,
                 stream: true,
               });
+
+              const { emitter, completionPromise } = await Promise.race([
+                sessionPromise,
+                ...cancelRaceList,
+              ]);
+
+              streamEmitter = emitter;
 
               emitter.once("done", ({ context }) => {
                 activeSession.turnCount = (activeSession.turnCount || 0) + 1;
@@ -160,16 +204,20 @@ export class SessionManager {
               // Hand emitter back to HTTP handler immediately for real-time SSE streaming
               resolveResult(emitter);
 
-              // Await prompt completion before allowing the next turn on THIS session's queue
-              await completionPromise;
+              // Await prompt completion, timeout, or client abort
+              await Promise.race([completionPromise, ...cancelRaceList]);
               activeSession.lastActiveAt = Date.now();
             } else {
-              const result = await this.acp.executeOnSession({
-                sessionId: activeSession.acpSessionId,
-                promptText,
-                stream: false,
-                responseFormat,
-              });
+              const result = await Promise.race([
+                this.acp.executeOnSession({
+                  sessionId: activeSession.acpSessionId,
+                  promptText,
+                  stream: false,
+                  responseFormat,
+                }),
+                ...cancelRaceList,
+              ]);
+
               activeSession.turnCount = (activeSession.turnCount || 0) + 1;
               if (result.context) {
                 activeSession.lastPromptTokens = result.context.promptTokens;
@@ -182,13 +230,20 @@ export class SessionManager {
               resolveResult(result);
             }
           } catch (turnErr) {
-            // If the turn failed due to an invalid/crashed session, evict it
-            if (turnErr.message && (turnErr.message.includes("turn") || turnErr.message.includes("session"))) {
-              console.warn(`[SessionManager] Evicting broken session '${sessionKey}' (${activeSession.acpSessionId}): ${turnErr.message}`);
-              this.sessions.delete(sessionKey);
+            console.warn(`[SessionManager] Turn error on session '${sessionKey}': ${turnErr.message}`);
+            // Evict broken or aborted session so subsequent turns start with a clean state
+            this.sessions.delete(sessionKey);
+            try {
+              await this.acp.cancelSession(activeSession.acpSessionId);
+            } catch (e) {}
+
+            if (streamEmitter) {
+              streamEmitter.emit("error", turnErr);
             }
             rejectResult(turnErr);
           } finally {
+            if (turnTimer) clearTimeout(turnTimer);
+            if (signal && onAbort) signal.removeEventListener("abort", onAbort);
             activeSession.activeTurns = Math.max(0, (activeSession.activeTurns || 1) - 1);
           }
         });

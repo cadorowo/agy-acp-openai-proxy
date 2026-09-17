@@ -35,6 +35,7 @@ export class ACPClient extends EventEmitter {
     super();
     this.command = config.command || "agy-acp";
     this.defaultCwd = config.cwd || process.cwd();
+    this.env = config.env || {};
     this.childProcess = null;
     this.requestId = 1;
     this.pending = new Map();
@@ -42,6 +43,17 @@ export class ACPClient extends EventEmitter {
     this.buffer = "";
     this.isReady = false;
     this.initPromise = null;
+  }
+
+  close() {
+    if (this.childProcess) {
+      try {
+        this.childProcess.kill("SIGTERM");
+      } catch {}
+      this.childProcess = null;
+      this.isReady = false;
+      this.initPromise = null;
+    }
   }
 
   async ensureStarted() {
@@ -58,7 +70,7 @@ export class ACPClient extends EventEmitter {
 
       this.childProcess = spawn(bin, args, {
         stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env },
+        env: { ...process.env, ...this.env },
       });
 
       this.childProcess.stdout.setEncoding("utf-8");
