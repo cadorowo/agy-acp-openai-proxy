@@ -11,8 +11,8 @@ The proxy exposes a standard **OpenAI v1-compatible REST API** that transparentl
 
 ### Network Endpoints
 * **Localhost (Host Machine):** `http://127.0.0.1:1234/v1`
-* **Tailscale Mesh (Remote PCs, MacBooks, VPS):** `http://100.74.82.76:1234/v1`
-* **Health Check:** `http://127.0.0.1:1234/health` or `http://100.74.82.76:1234/health`
+* **Remote / Tailscale Mesh:** `http://<YOUR_SERVER_IP>:1234/v1`
+* **Health Check:** `http://127.0.0.1:1234/health` or `http://<YOUR_SERVER_IP>:1234/health`
 
 ---
 
@@ -114,8 +114,8 @@ The proxy features a built-in JSON sanitization engine for `response_format`:
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://100.74.82.76:1234/v1",  # Or http://127.0.0.1:1234/v1
-    api_key="your-proxy-key",               # Dummy string if no key is configured
+    base_url="http://localhost:1234/v1",  # Or http://<YOUR_SERVER_IP>:1234/v1
+    api_key="your-proxy-key",            # Dummy string if no key is configured
     default_headers={"X-Session-Id": "agent-thread-001"}
 )
 
@@ -137,7 +137,7 @@ for chunk in response:
 ### B. TypeScript / Node.js (`fetch`)
 
 ```typescript
-const response = await fetch("http://100.74.82.76:1234/v1/chat/completions", {
+const response = await fetch("http://localhost:1234/v1/chat/completions", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
@@ -159,7 +159,7 @@ console.log(data.choices[0].message.content);
 
 ```bash
 # Streaming turn with custom session ID
-curl -N -X POST http://100.74.82.76:1234/v1/chat/completions \
+curl -N -X POST http://localhost:1234/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "X-Session-Id: terminal-test" \
   -d '{

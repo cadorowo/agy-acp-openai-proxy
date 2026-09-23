@@ -58,14 +58,14 @@ Before scaling to multi-device usage, critical architectural risks around **conc
 
 | Solution | Latency Overhead | SSE / Streaming Compatibility | Security / Auth Layer | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **Tailscale (Mesh VPN)** | Near-zero (direct Wireguard P2P) | Native raw TCP, zero buffering | Tailscale node auth, private IPs | **Active & Recommended** (`100.74.82.76:1234`) |
+| **Tailscale (Mesh VPN)** | Near-zero (direct Wireguard P2P) | Native raw TCP, zero buffering | Tailscale node auth, private IPs | **Active & Recommended** (`<TAILSCALE_IP>:1234`) |
 | **Cloudflare Tunnel (cloudflared)** | Moderate (routed via Cloudflare edge) | Requires chunked transfer & disabled response buffering | Needs Cloudflare Access / Service Tokens | Optional for public ingress |
 | **SSH Reverse Tunnel (`ssh -R`)** | Minimal | Native raw TCP | SSH key authentication | Reliable fallback |
 
 ### 3.2 Security & Network Binding
 * **Current State:** The proxy operates with `modeId: "yolo"` and auto-approves tool requests (`session/request_permission` $\rightarrow$ `"allow"`).
 * **Implemented Mitigations:**
-  1. **Network Binding:** Bound exclusively to `127.0.0.1` and the verified Tailscale interface IP (`100.74.82.76:1234`). Public LAN binding (`0.0.0.0`) is disabled.
+  1. **Network Binding:** Bound exclusively to `127.0.0.1` and the verified private network interface IP. Public LAN binding (`0.0.0.0`) is disabled.
   2. **Bearer Token Authentication:** Enforced via `auth.js` when `PROXY_API_KEY` is provided in environment.
   3. **CORS Preflight:** Standard permissive CORS with preflight `OPTIONS` handling.
 
